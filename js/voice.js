@@ -100,6 +100,44 @@ function spokenDigits(n){
 
 }
 
+// Converts a raw callsign (e.g. "IGO121") into how it's
+// actually spoken over the radio (e.g. "IFLY one two one").
+// Known airline prefixes use their real RT callsign; unknown
+// ones fall back to spelling the letters phonetically.
+function spokenCallsign(callsign){
+
+    const match = callsign.match(/^([A-Za-z]+)(\d+)$/);
+
+    if(!match){
+        return callsign;   // not in the expected format - just say it as-is
+    }
+
+    const alpha = match[1].toUpperCase();
+    const digits = match[2];
+
+    let alphaSpoken;
+
+    if(typeof AIRLINE_CALLSIGNS !== "undefined" && AIRLINE_CALLSIGNS[alpha]){
+
+        alphaSpoken = AIRLINE_CALLSIGNS[alpha];
+
+    }
+    else{
+
+        alphaSpoken = alpha.split("").map(letter=>{
+            return (typeof REVERSE_NATO !== "undefined" && REVERSE_NATO[letter])
+                ? REVERSE_NATO[letter]
+                : letter;
+        }).join(" ");
+
+    }
+
+    const digitsSpoken = digits.split("").map(d => DIGIT_WORDS[d] || d).join(" ");
+
+    return alphaSpoken + " " + digitsSpoken;
+
+}
+
 // ======================================
 // Text to speech (pilot voice)
 // ======================================
@@ -128,6 +166,30 @@ function speak(text){
 // often mangles letter/number callsigns)
 // ======================================
 
+// Decode NATO phonetic words in a transcript into letters,
+// leaving everything else untouched (words -> letters, spaces
+// collapsed) - improves matching "golf foxtrot alpha one zero
+// three" against callsign "GFA103".
+function phoneticDecode(text){
+
+    const words = text.toLowerCase().split(/\s+/);
+
+    return words.map(w => {
+
+        if(typeof NATO_ALPHABET !== "undefined" && NATO_ALPHABET[w]){
+            return NATO_ALPHABET[w];
+        }
+
+        if(typeof WORD_TO_DIGIT !== "undefined" && WORD_TO_DIGIT[w] !== undefined){
+            return WORD_TO_DIGIT[w];
+        }
+
+        return w;
+
+    }).join("");
+
+}
+
 function findAircraftBySpokenCallsign(text){
 
     const activeList = [
@@ -135,7 +197,12 @@ function findAircraftBySpokenCallsign(text){
         ...(typeof departures !== "undefined" ? departures : [])
     ].filter(ac => ac.active);
 
-    const normalizedText = text.toUpperCase().replace(/[^A-Z0-9]/g, "");
+    // Try both the raw transcript and a phonetically-decoded
+    // version, since speech recognition sometimes returns
+    // formed callsigns ("GFA103") and sometimes spells them out
+    // ("golf foxtrot alpha one zero three").
+    const rawNormalized = text.toUpperCase().replace(/[^A-Z0-9]/g, "");
+    const phoneticNormalized = phoneticDecode(text).toUpperCase();
 
     let best = null;
     let bestLen = 0;
@@ -144,7 +211,19 @@ function findAircraftBySpokenCallsign(text){
 
         const cs = ac.callsign.toUpperCase().replace(/[^A-Z0-9]/g, "");
 
-        if(normalizedText.includes(cs) && cs.length > bestLen){
+        // Also check the aircraft's real RT callsign form
+        // (e.g. controller says "IFLY 121" for IGO121)
+        const rtNormalized = (typeof spokenCallsign === "function")
+            ? spokenCallsign(ac.callsign).toUpperCase().replace(/[^A-Z0-9]/g, "")
+            : "";
+
+        const hit =
+            rawNormalized.includes(cs) ||
+            phoneticNormalized.includes(cs) ||
+            (rtNormalized && rawNormalized.includes(rtNormalized)) ||
+            (rtNormalized && phoneticNormalized.includes(rtNormalized));
+
+        if(hit && cs.length > bestLen){
             best = ac;
             bestLen = cs.length;
         }
@@ -152,6 +231,52 @@ function findAircraftBySpokenCallsign(text){
     });
 
     return best;
+
+}
+
+// ======================================
+// Robust digit-sequence extraction.
+// Scans forward from a phrase match and
+// concatenates EVERY consecutive numeric
+// token (whether the recognizer gave us a
+// formed numeral like "170" or separate
+// spoken digits "one seven zero") - this
+// is what fixes "170" being truncated to
+// "17".
+// ======================================
+
+function extractNumberAfter(text, matchIndex, matchedPhraseLength){
+
+    const after = text.slice(matchIndex + matchedPhraseLength);
+    const words = after.trim().split(/\s+/);
+
+    let digits = "";
+
+    for(let i = 0; i < words.length; i++){
+
+        const w = words[i].replace(/[^a-z0-9]/g, "");
+
+        if(/^\d+$/.test(w)){
+            digits += w;
+            continue;
+        }
+
+        if(typeof WORD_TO_DIGIT !== "undefined" && WORD_TO_DIGIT[w] !== undefined){
+            digits += WORD_TO_DIGIT[w];
+            continue;
+        }
+
+        // "hundred"/"thousand" from a misheard/rounded number -
+        // skip rather than abort, in case a stray word slips in
+        if(w === "hundred" || w === "thousand" || w === ""){
+            continue;
+        }
+
+        break;   // first non-numeric word ends the number
+
+    }
+
+    return digits.length ? parseInt(digits, 10) : null;
 
 }
 
@@ -176,71 +301,129 @@ function parseATCCommand(rawText){
         intercept: false,
         discontinue: false,
         mayday: false,
-        panPan: false
+        panPan: false,
+        reportLevel: false,
+        reportHeading: false,
+        reportSpeed: false,
+        reportPosition: false
     };
 
-    // Heading
-    const hdgMatch = text.match(/heading\s*(\d{1,3})/);
-    if(hdgMatch){
-        cmd.heading = parseInt(hdgMatch[1]) % 360;
+    // ---- Report/query commands (check first - these don't
+    // change anything, just ask the pilot to state a value) ----
 
-        const beforeHdg = text.slice(0, hdgMatch.index);
-        if(/left[^.]{0,15}$/.test(beforeHdg)) cmd.turnDirection = "LEFT";
-        else if(/right[^.]{0,15}$/.test(beforeHdg)) cmd.turnDirection = "RIGHT";
-        else cmd.turnDirection = "SHORTEST";
+    if(findPhrase(text, PHRASES.reportLevel))    cmd.reportLevel = true;
+    if(findPhrase(text, PHRASES.reportHeading))  cmd.reportHeading = true;
+    if(findPhrase(text, PHRASES.reportSpeed))    cmd.reportSpeed = true;
+    if(findPhrase(text, PHRASES.reportPosition)) cmd.reportPosition = true;
+
+    if(cmd.reportLevel || cmd.reportHeading || cmd.reportSpeed || cmd.reportPosition){
+        return cmd;   // report commands are standalone
     }
 
-    // Level (flight level or feet)
-    const flMatch = text.match(/flight level\s*(\d{1,3})/);
-    const ftMatch = text.match(/(\d{3,5})\s*feet/);
+    // ---- Heading ----
 
-    if(flMatch){
-        cmd.level = parseInt(flMatch[1]);
+    let hdgHit = findPhrase(text, PHRASES.turnLeft);
+    if(hdgHit){
+        cmd.turnDirection = "LEFT";
     }
-    else if(ftMatch){
-        cmd.level = Math.round(parseInt(ftMatch[1]) / 100);
-    }
-
-    if(cmd.level !== null){
-        if(/descend/.test(text)) cmd.levelAction = "descend";
-        else if(/climb/.test(text)) cmd.levelAction = "climb";
-    }
-
-    // Speed
-    const spdMatch = text.match(/speed\s*(\d{2,3})/);
-    if(spdMatch){
-        cmd.speed = parseInt(spdMatch[1]);
+    else{
+        hdgHit = findPhrase(text, PHRASES.turnRight);
+        if(hdgHit) cmd.turnDirection = "RIGHT";
+        else{
+            hdgHit = findPhrase(text, PHRASES.fly);
+            if(hdgHit) cmd.turnDirection = "SHORTEST";
+        }
     }
 
-    // Squawk
-    const sqMatch = text.match(/squawk\s*(\d{4})/);
-    if(sqMatch){
-        cmd.squawk = sqMatch[1];
+    if(hdgHit){
+
+        const num = extractNumberAfter(text, hdgHit.index, hdgHit.phrase.length);
+
+        if(num !== null){
+            cmd.heading = num % 360;
+        }
+
     }
 
-    // Direct to fix
-    const fixNames = (typeof FIXES !== "undefined") ? FIXES.map(f => f.name) : [];
-    const dctMatch = text.match(/direct\s+([a-z]+)/);
+    // ---- Level (climb/descend/maintain, FL or feet) ----
 
-    if(dctMatch){
-        const spoken = dctMatch[1].toUpperCase();
+    let levelHit = findPhrase(text, PHRASES.climb);
+    if(levelHit) cmd.levelAction = "climb";
+    else{
+        levelHit = findPhrase(text, PHRASES.descend);
+        if(levelHit) cmd.levelAction = "descend";
+        else{
+            levelHit = findPhrase(text, PHRASES.maintain);
+        }
+    }
+
+    if(levelHit){
+
+        let num = extractNumberAfter(text, levelHit.index, levelHit.phrase.length);
+
+        if(num !== null){
+
+            // If they said e.g. "5000 feet" that's feet, not FL
+            const feetHit = text.indexOf("feet");
+            const flHit = text.indexOf("flight level");
+
+            if(feetHit !== -1 && (flHit === -1 || feetHit < flHit + 20)){
+                num = Math.round(num / 100);
+            }
+
+            cmd.level = num;
+
+        }
+
+    }
+
+    // ---- Speed ----
+
+    const spdHit = findPhrase(text, PHRASES.speed);
+    if(spdHit){
+
+        const num = extractNumberAfter(text, spdHit.index, spdHit.phrase.length);
+        if(num !== null) cmd.speed = num;
+
+    }
+
+    // ---- Squawk ----
+
+    const sqHit = findPhrase(text, PHRASES.squawk);
+    if(sqHit){
+
+        const num = extractNumberAfter(text, sqHit.index, sqHit.phrase.length);
+        if(num !== null) cmd.squawk = String(num).padStart(4,"0");
+
+    }
+
+    // ---- Direct to fix ----
+
+    const dctHit = findPhrase(text, PHRASES.directTo);
+    if(dctHit){
+
+        const after = text.slice(dctHit.index + dctHit.phrase.length).trim();
+        const spoken = after.split(/\s+/)[0] ? after.split(/\s+/)[0].toUpperCase() : "";
+
+        const fixNames = (typeof FIXES !== "undefined") ? FIXES.map(f => f.name) : [];
         const match = fixNames.find(f => f === spoken || f.startsWith(spoken));
+
         if(match) cmd.directToFix = match;
+
     }
 
-    // Intercept / vectors to final
-    if(/intercept|localiser|localizer|vector/.test(text)){
-        cmd.intercept = true;
-    }
+    // ---- Intercept / vectors ----
 
-    // Go-around / discontinue
-    if(/go\s*around|discontinue/.test(text)){
-        cmd.discontinue = true;
-    }
+    if(findPhrase(text, PHRASES.intercept)) cmd.intercept = true;
 
-    // Emergency
-    if(/mayday/.test(text)) cmd.mayday = true;
-    if(/pan\s*pan/.test(text)) cmd.panPan = true;
+    // ---- Go-around ----
+
+    if(findPhrase(text, PHRASES.goAround)) cmd.discontinue = true;
+
+    // ---- Emergency ----
+
+    if(findPhrase(text, PHRASES.mayday)) cmd.mayday = true;
+    if(findPhrase(text, PHRASES.panPan)) cmd.panPan = true;
 
     return cmd;
 
@@ -338,7 +521,7 @@ function executeATCCommand(ac, cmd){
         readbackParts.push("Say again");
     }
 
-    const readback = readbackParts.join(", ") + ", " + ac.callsign;
+    const readback = readbackParts.join(", ") + ", " + spokenCallsign(ac.callsign);
 
     logTransmission("PILOT", ac.callsign, readback);
     speak(readback);
@@ -416,14 +599,52 @@ function handleControllerTransmission(transcript){
     const cmd = parseATCCommand(transcript);
 
     if(cmd.mayday){
-        logTransmission("PILOT", ac.callsign, "Mayday, Mayday, Mayday, " + ac.callsign);
-        speak("Mayday, Mayday, Mayday, " + ac.callsign);
+        const text = "Mayday, Mayday, Mayday, " + spokenCallsign(ac.callsign);
+        logTransmission("PILOT", ac.callsign, text);
+        speak(text);
         return;
     }
 
     if(cmd.panPan){
-        logTransmission("PILOT", ac.callsign, "Pan Pan, Pan Pan, Pan Pan, " + ac.callsign);
-        speak("Pan Pan, Pan Pan, Pan Pan, " + ac.callsign);
+        const text = "Pan Pan, Pan Pan, Pan Pan, " + spokenCallsign(ac.callsign);
+        logTransmission("PILOT", ac.callsign, text);
+        speak(text);
+        return;
+    }
+
+    // Report/query commands - state what's actually happening,
+    // don't change anything
+    if(cmd.reportLevel){
+        const text = spokenCallsign(ac.callsign) + ", level " + spokenDigits(Math.round(ac.level)) +
+            (Math.round(ac.level) !== Math.round(ac.targetLevel)
+                ? (ac.level > ac.targetLevel ? ", descending" : ", climbing") +
+                  " Flight Level " + spokenDigits(Math.round(ac.targetLevel))
+                : "");
+        logTransmission("PILOT", ac.callsign, text);
+        speak(text);
+        return;
+    }
+
+    if(cmd.reportHeading){
+        const text = spokenCallsign(ac.callsign) + ", heading " + spokenDigits(Math.round(ac.heading));
+        logTransmission("PILOT", ac.callsign, text);
+        speak(text);
+        return;
+    }
+
+    if(cmd.reportSpeed){
+        const text = spokenCallsign(ac.callsign) + ", speed " + spokenDigits(Math.round(ac.speed));
+        logTransmission("PILOT", ac.callsign, text);
+        speak(text);
+        return;
+    }
+
+    if(cmd.reportPosition){
+        const dx = ac.x - CCB.x, dy = ac.y - CCB.y;
+        const distNM = Math.round(Math.sqrt(dx*dx+dy*dy) / PIXELS_PER_NM);
+        const text = spokenCallsign(ac.callsign) + ", " + distNM + " miles from CCB";
+        logTransmission("PILOT", ac.callsign, text);
+        speak(text);
         return;
     }
 
@@ -471,7 +692,7 @@ function announceMayday(){
         return;
     }
 
-    const text = "Mayday, Mayday, Mayday, " + selectedAircraft.callsign;
+    const text = "Mayday, Mayday, Mayday, " + spokenCallsign(selectedAircraft.callsign);
     logTransmission("PILOT", selectedAircraft.callsign, text);
     speak(text);
 
@@ -484,7 +705,7 @@ function announcePanPan(){
         return;
     }
 
-    const text = "Pan Pan, Pan Pan, Pan Pan, " + selectedAircraft.callsign;
+    const text = "Pan Pan, Pan Pan, Pan Pan, " + spokenCallsign(selectedAircraft.callsign);
     logTransmission("PILOT", selectedAircraft.callsign, text);
     speak(text);
 
@@ -511,7 +732,7 @@ function checkAutoRadioCalls(){
 
             ac.radioCheckedIn = true;
 
-            const text = ac.callsign + ", level " + spokenDigits(Math.round(ac.level)) +
+            const text = spokenCallsign(ac.callsign) + ", level " + spokenDigits(Math.round(ac.level)) +
                 (ac.squawk ? ", squawk " + spokenDigits(parseInt(ac.squawk)) : "");
 
             logTransmission("PILOT", ac.callsign, text);
@@ -526,7 +747,7 @@ function checkAutoRadioCalls(){
 
             ac.radioLastLevelCalled = Math.round(ac.targetLevel);
 
-            const text = ac.callsign + ", level " + spokenDigits(Math.round(ac.level));
+            const text = spokenCallsign(ac.callsign) + ", level " + spokenDigits(Math.round(ac.level));
 
             logTransmission("PILOT", ac.callsign, text);
             speak(text);
@@ -538,7 +759,7 @@ function checkAutoRadioCalls(){
 
             ac.radioEstablishedCalled = true;
 
-            const text = ac.callsign + ", established localiser";
+            const text = spokenCallsign(ac.callsign) + ", established localiser";
 
             logTransmission("PILOT", ac.callsign, text);
             speak(text);
@@ -554,7 +775,7 @@ function checkAutoRadioCalls(){
 
             ac.radioApproachCalled = true;
 
-            const text = ac.callsign + ", established, final approach";
+            const text = spokenCallsign(ac.callsign) + ", established, final approach";
 
             logTransmission("PILOT", ac.callsign, text);
             speak(text);
